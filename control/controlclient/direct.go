@@ -84,8 +84,8 @@ type Direct struct {
 	serverKey      key.MachinePublic // original ("legacy") nacl crypto_box-based public key
 	serverNoiseKey key.MachinePublic
 
-	sfGroup     singleflight.Group[struct{}, *noiseClient] // protects noiseClient creation.
-	noiseClient *noiseClient
+	sfGroup     singleflight.Group[struct{}, *NoiseClient] // protects noiseClient creation.
+	noiseClient *NoiseClient
 
 	persist       persist.Persist
 	authKey       string
@@ -94,6 +94,7 @@ type Direct struct {
 	hostinfo      *tailcfg.Hostinfo // always non-nil
 	netinfo       *tailcfg.NetInfo
 	endpoints     []tailcfg.Endpoint
+	tkaHead       string
 	everEndpoints bool   // whether we've ever had non-empty endpoints
 	lastPingURL   string // last PingRequest.URL received, for dup suppression
 }
@@ -261,7 +262,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		}
 	}
 	if opts.NoiseTestClient != nil {
-		c.noiseClient = &noiseClient{
+		c.noiseClient = &NoiseClient{
 			Client: opts.NoiseTestClient,
 		}
 		c.serverNoiseKey = key.NewMachine().Public() // prevent early error before hitting test client
@@ -314,6 +315,21 @@ func (c *Direct) SetNetInfo(ni *tailcfg.NetInfo) bool {
 	}
 	c.netinfo = ni.Clone()
 	c.logf("NetInfo: %v", ni)
+	return true
+}
+
+// SetNetInfo stores a new TKA head value for next update.
+// It reports whether the TKA head changed.
+func (c *Direct) SetTKAHead(tkaHead string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if tkaHead == c.tkaHead {
+		return false
+	}
+
+	c.tkaHead = tkaHead
+	c.logf("tkaHead: %v", tkaHead)
 	return true
 }
 
@@ -821,7 +837,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, readOnly bool
 	request := &tailcfg.MapRequest{
 		Version:       tailcfg.CurrentCapabilityVersion,
 		KeepAlive:     c.keepAlive,
-		NodeKey:       persist.PrivateNodeKey.Public(),
+		NodeKey:       persist.PublicNodeKey(),
 		DiscoKey:      c.discoPubKey,
 		Endpoints:     epStrs,
 		EndpointTypes: epTypes,
@@ -829,6 +845,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, readOnly bool
 		Hostinfo:      hi,
 		DebugFlags:    c.debugFlags,
 		OmitPeers:     cb == nil,
+		TKAHead:       c.tkaHead,
 
 		// On initial startup before we know our endpoints, set the ReadOnly flag
 		// to tell the control server not to distribute out our (empty) endpoints to peers.
@@ -1453,7 +1470,7 @@ func sleepAsRequested(ctx context.Context, logf logger.Logf, timeoutReset chan<-
 }
 
 // getNoiseClient returns the noise client, creating one if one doesn't exist.
-func (c *Direct) getNoiseClient() (*noiseClient, error) {
+func (c *Direct) getNoiseClient() (*NoiseClient, error) {
 	c.mu.Lock()
 	serverNoiseKey := c.serverNoiseKey
 	nc := c.noiseClient
@@ -1468,13 +1485,13 @@ func (c *Direct) getNoiseClient() (*noiseClient, error) {
 	if c.dialPlan != nil {
 		dp = c.dialPlan.Load
 	}
-	nc, err, _ := c.sfGroup.Do(struct{}{}, func() (*noiseClient, error) {
+	nc, err, _ := c.sfGroup.Do(struct{}{}, func() (*NoiseClient, error) {
 		k, err := c.getMachinePrivKey()
 		if err != nil {
 			return nil, err
 		}
 		c.logf("creating new noise client")
-		nc, err := newNoiseClient(k, serverNoiseKey, c.serverURL, c.dialer, dp)
+		nc, err := NewNoiseClient(k, serverNoiseKey, c.serverURL, c.dialer, dp)
 		if err != nil {
 			return nil, err
 		}
@@ -1588,6 +1605,20 @@ func (c *Direct) DoNoiseRequest(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	return nc.Do(req)
+}
+
+// GetSingleUseNoiseRoundTripper returns a RoundTripper that can be only be used
+// once (and must be used once) to make a single HTTP request over the noise
+// channel to the coordination server.
+//
+// In addition to the RoundTripper, it returns the HTTP/2 channel's early noise
+// payload, if any.
+func (c *Direct) GetSingleUseNoiseRoundTripper(ctx context.Context) (http.RoundTripper, *tailcfg.EarlyNoise, error) {
+	nc, err := c.getNoiseClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	return nc.GetSingleUseRoundTripper(ctx)
 }
 
 // doPingerPing sends a Ping to pr.IP using pinger, and sends an http request back to

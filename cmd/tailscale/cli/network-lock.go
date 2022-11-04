@@ -5,6 +5,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ var netlockCmd = &ffcli.Command{
 		nlStatusCmd,
 		nlAddCmd,
 		nlRemoveCmd,
+		nlSignCmd,
 	},
 	Exec: runNetworkLockStatus,
 }
@@ -51,7 +53,10 @@ func runNetworkLockInit(ctx context.Context, args []string) error {
 		return err
 	}
 
-	status, err := localClient.NetworkLockInit(ctx, keys)
+	// TODO(tom): Implement specification of disablement values from the command line.
+	disablementValues := [][]byte{bytes.Repeat([]byte{0xa5}, 32)}
+
+	status, err := localClient.NetworkLockInit(ctx, keys, disablementValues)
 	if err != nil {
 		return err
 	}
@@ -158,4 +163,28 @@ func runNetworkLockModify(ctx context.Context, addArgs, removeArgs []string) err
 
 	fmt.Printf("Status: %+v\n\n", status)
 	return nil
+}
+
+var nlSignCmd = &ffcli.Command{
+	Name:       "sign",
+	ShortUsage: "sign <node-key>",
+	ShortHelp:  "Signs a node-key and transmits that signature to the control plane",
+	Exec:       runNetworkLockSign,
+}
+
+// TODO(tom): Implement specifying the rotation key for the signature.
+func runNetworkLockSign(ctx context.Context, args []string) error {
+	switch len(args) {
+	case 0:
+		return errors.New("expected node-key as second argument")
+	case 1:
+		var nodeKey key.NodePublic
+		if err := nodeKey.UnmarshalText([]byte(args[0])); err != nil {
+			return fmt.Errorf("decoding node-key: %w", err)
+		}
+
+		return localClient.NetworkLockSign(ctx, nodeKey, nil)
+	default:
+		return errors.New("expected a single node-key as only argument")
+	}
 }

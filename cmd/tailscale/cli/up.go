@@ -95,7 +95,7 @@ func newUpFlagSet(goos string, upArgs *upArgsT) *flag.FlagSet {
 	upf.StringVar(&upArgs.server, "login-server", ipn.DefaultControlURL, "base URL of control server")
 	upf.BoolVar(&upArgs.acceptRoutes, "accept-routes", acceptRouteDefault(goos), "accept routes advertised by other Tailscale nodes")
 	upf.BoolVar(&upArgs.acceptDNS, "accept-dns", true, "accept DNS configuration from the admin panel")
-	upf.BoolVar(&upArgs.singleRoutes, "host-routes", true, "install host routes to other Tailscale nodes")
+	upf.BoolVar(&upArgs.singleRoutes, "host-routes", true, "HIDDEN: install host routes to other Tailscale nodes")
 	upf.StringVar(&upArgs.exitNodeIP, "exit-node", "", "Tailscale exit node (IP or base name) for internet traffic, or empty string to not use an exit node")
 	upf.BoolVar(&upArgs.exitNodeAllowLANAccess, "exit-node-allow-lan-access", false, "Allow direct access to the local network when routing traffic via an exit node")
 	upf.BoolVar(&upArgs.shieldsUp, "shields-up", false, "don't allow incoming connections")
@@ -380,15 +380,8 @@ func updatePrefs(prefs, curPrefs *ipn.Prefs, env upCheckEnv) (simpleUp bool, jus
 	// Do this after validations to avoid the 5s delay if we're going to error
 	// out anyway.
 	wantSSH, haveSSH := env.upArgs.runSSH, curPrefs.RunSSH
-	if wantSSH != haveSSH && isSSHOverTailscale() {
-		if wantSSH {
-			err = presentRiskToUser(riskLoseSSH, `You are connected over Tailscale; this action will reroute SSH traffic to Tailscale SSH and will result in your session disconnecting.`, env.upArgs.acceptedRisks)
-		} else {
-			err = presentRiskToUser(riskLoseSSH, `You are connected using Tailscale SSH; this action will result in your session disconnecting.`, env.upArgs.acceptedRisks)
-		}
-		if err != nil {
-			return false, nil, err
-		}
+	if err := presentSSHToggleRisk(wantSSH, haveSSH, env.upArgs.acceptedRisks); err != nil {
+		return false, nil, err
 	}
 
 	tagsChanged := !reflect.DeepEqual(curPrefs.AdvertiseTags, prefs.AdvertiseTags)
@@ -413,11 +406,21 @@ func updatePrefs(prefs, curPrefs *ipn.Prefs, env upCheckEnv) (simpleUp bool, jus
 			visitFlags = env.flagSet.VisitAll
 		}
 		visitFlags(func(f *flag.Flag) {
-			updateMaskedPrefsFromUpFlag(justEditMP, f.Name)
+			updateMaskedPrefsFromUpOrSetFlag(justEditMP, f.Name)
 		})
 	}
 
 	return simpleUp, justEditMP, nil
+}
+
+func presentSSHToggleRisk(wantSSH, haveSSH bool, acceptedRisks string) error {
+	if !isSSHOverTailscale() || wantSSH == haveSSH {
+		return nil
+	}
+	if wantSSH {
+		return presentRiskToUser(riskLoseSSH, `You are connected over Tailscale; this action will reroute SSH traffic to Tailscale SSH and will result in your session disconnecting.`, acceptedRisks)
+	}
+	return presentRiskToUser(riskLoseSSH, `You are connected using Tailscale SSH; this action will result in your session disconnecting.`, acceptedRisks)
 }
 
 func runUp(ctx context.Context, args []string) (retErr error) {
@@ -773,7 +776,7 @@ func preflessFlag(flagName string) bool {
 	return false
 }
 
-func updateMaskedPrefsFromUpFlag(mp *ipn.MaskedPrefs, flagName string) {
+func updateMaskedPrefsFromUpOrSetFlag(mp *ipn.MaskedPrefs, flagName string) {
 	if preflessFlag(flagName) {
 		return
 	}

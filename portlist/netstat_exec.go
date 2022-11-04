@@ -15,22 +15,12 @@ import (
 	"strings"
 )
 
-var osHideWindow func(*exec.Cmd) // non-nil on Windows; see portlist_windows.go
-
-// hideWindow returns c. On Windows it first sets SysProcAttr.HideWindow.
-func hideWindow(c *exec.Cmd) *exec.Cmd {
-	if osHideWindow != nil {
-		osHideWindow(c)
-	}
-	return c
-}
-
-func listPortsNetstat(arg string) (List, error) {
+func appendListeningPortsNetstat(base []Port, arg string) ([]Port, error) {
 	exe, err := exec.LookPath("netstat")
 	if err != nil {
 		return nil, fmt.Errorf("netstat: lookup: %v", err)
 	}
-	output, err := hideWindow(exec.Command(exe, arg)).Output()
+	output, err := exec.Command(exe, arg).Output()
 	if err != nil {
 		xe, ok := err.(*exec.ExitError)
 		stderr := ""
@@ -40,5 +30,5 @@ func listPortsNetstat(arg string) (List, error) {
 		return nil, fmt.Errorf("netstat: %v (%q)", err, stderr)
 	}
 
-	return parsePortsNetstat(string(output)), nil
+	return appendParsePortsNetstat(base, string(output)), nil
 }

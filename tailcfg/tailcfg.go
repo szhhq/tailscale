@@ -84,7 +84,9 @@ type CapabilityVersion int
 //   - 45: 2022-09-26: c2n /debug/{goroutines,prefs,metrics}
 //   - 46: 2022-10-04: c2n /debug/component-logging
 //   - 47: 2022-10-11: Register{Request,Response}.NodeKeySignature
-const CurrentCapabilityVersion CapabilityVersion = 47
+//   - 48: 2022-11-02: Node.UnsignedPeerAPIOnly
+//   - 49: 2022-11-03: Client understands EarlyNoise
+const CurrentCapabilityVersion CapabilityVersion = 49
 
 type StableID string
 
@@ -230,6 +232,14 @@ type Node struct {
 	//    "https://tailscale.com/cap/is-admin"
 	//    "https://tailscale.com/cap/file-sharing"
 	Capabilities []string `json:",omitempty"`
+
+	// UnsignedPeerAPIOnly means that this node is not signed nor subject to TKA
+	// restrictions. However, in exchange for that privilege, it does not get
+	// network access. It can only access this node's peerapi, which may not let
+	// it do anything. It is the tailscaled client's job to double-check the
+	// MapResponse's PacketFilter to verify that its AllowedIPs will not be
+	// accepted by the packet filter.
+	UnsignedPeerAPIOnly bool `json:",omitempty"`
 
 	// The following three computed fields hold the various names that can
 	// be used for this node in UIs. They are populated from controlclient
@@ -947,6 +957,11 @@ type MapRequest struct {
 	// EndpointTypes are the types of the corresponding endpoints in Endpoints.
 	EndpointTypes []EndpointType `json:",omitempty"`
 
+	// TKAHead describes the hash of the latest AUM applied to the local
+	// tailnet key authority, if one is operating.
+	// It is encoded as tka.AUMHash.MarshalText.
+	TKAHead string `json:",omitempty"`
+
 	// ReadOnly is whether the client just wants to fetch the
 	// MapResponse, without updating their Endpoints. The
 	// Endpoints field will be ignored and LastSeen will not be
@@ -1121,9 +1136,6 @@ type DNSConfig struct {
 
 	// Nameservers are the IP addresses of the nameservers to use.
 	Nameservers []netip.Addr `json:",omitempty"`
-
-	// PerDomain is not set by the control server, and does nothing.
-	PerDomain bool `json:",omitempty"`
 
 	// CertDomains are the set of DNS names for which the control
 	// plane server will assist with provisioning TLS
@@ -1550,6 +1562,7 @@ func (n *Node) Equal(n2 *Node) bool {
 		n.Name == n2.Name &&
 		n.User == n2.User &&
 		n.Sharer == n2.Sharer &&
+		n.UnsignedPeerAPIOnly == n2.UnsignedPeerAPIOnly &&
 		n.Key == n2.Key &&
 		n.KeyExpiry.Equal(n2.KeyExpiry) &&
 		bytes.Equal(n.KeySignature, n2.KeySignature) &&
@@ -1944,3 +1957,15 @@ type PeerChange struct {
 //
 // Mnemonic: 3.3.40 are numbers above the keys D, E, R, P.
 const DerpMagicIP = "127.3.3.40"
+
+// EarlyNoise is the early payload that's sent over Noise but before the HTTP/2
+// handshake when connecting to the coordination server.
+//
+// This exists to let the server push some early info to client for that
+// stateful HTTP/2+Noise connection without incurring an extra round trip. (This
+// would've used HTTP/2 server push, had Go's client-side APIs been available)
+type EarlyNoise struct {
+	// NodeKeyChallenge is a random per-connection public key to be used by
+	// the client to prove possession of a wireguard private key.
+	NodeKeyChallenge key.ChallengePublic `json:"nodeKeyChallenge"`
+}

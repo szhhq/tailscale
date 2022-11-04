@@ -561,6 +561,11 @@ func (c *Auto) SetNetInfo(ni *tailcfg.NetInfo) {
 	c.sendNewMapRequest()
 }
 
+// SetTKAHead updates the TKA head hash that map-request infrastructure sends.
+func (c *Auto) SetTKAHead(headHash string) {
+	c.direct.SetTKAHead(headHash)
+}
+
 func (c *Auto) sendStatus(who string, err error, url string, nm *netmap.NetworkMap) {
 	c.mu.Lock()
 	if c.closed {
@@ -724,4 +729,14 @@ func (c *Auto) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) error {
 
 func (c *Auto) DoNoiseRequest(req *http.Request) (*http.Response, error) {
 	return c.direct.DoNoiseRequest(req)
+}
+
+// GetSingleUseNoiseRoundTripper returns a RoundTripper that can be only be used
+// once (and must be used once) to make a single HTTP request over the noise
+// channel to the coordination server.
+//
+// In addition to the RoundTripper, it returns the HTTP/2 channel's early noise
+// payload, if any.
+func (c *Auto) GetSingleUseNoiseRoundTripper(ctx context.Context) (http.RoundTripper, *tailcfg.EarlyNoise, error) {
+	return c.direct.GetSingleUseNoiseRoundTripper(ctx)
 }

@@ -34,6 +34,7 @@ import (
 	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
@@ -75,6 +76,7 @@ var handler = map[string]localAPIHandler{
 	"status":                  (*Handler).serveStatus,
 	"tka/init":                (*Handler).serveTKAInit,
 	"tka/modify":              (*Handler).serveTKAModify,
+	"tka/sign":                (*Handler).serveTKASign,
 	"tka/status":              (*Handler).serveTKAStatus,
 	"upload-client-metrics":   (*Handler).serveUploadClientMetrics,
 	"whois":                   (*Handler).serveWhoIs,
@@ -505,7 +507,7 @@ func (h *Handler) servePrefs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "prefs access denied", http.StatusForbidden)
 		return
 	}
-	var prefs *ipn.Prefs
+	var prefs ipn.PrefsView
 	switch r.Method {
 	case "PATCH":
 		if !h.PermitWrite {
@@ -921,6 +923,34 @@ func (h *Handler) serveTKAStatus(w http.ResponseWriter, r *http.Request) {
 	w.Write(j)
 }
 
+func (h *Handler) serveTKASign(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitRead {
+		http.Error(w, "lock status access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type signRequest struct {
+		NodeKey        key.NodePublic
+		RotationPublic []byte
+	}
+	var req signRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.b.NetworkLockSign(req.NodeKey, req.RotationPublic); err != nil {
+		http.Error(w, "signing failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
 func (h *Handler) serveTKAInit(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
 		http.Error(w, "lock init access denied", http.StatusForbidden)
@@ -932,7 +962,8 @@ func (h *Handler) serveTKAInit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type initRequest struct {
-		Keys []tka.Key
+		Keys              []tka.Key
+		DisablementValues [][]byte
 	}
 	var req initRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -940,7 +971,7 @@ func (h *Handler) serveTKAInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.b.NetworkLockInit(req.Keys); err != nil {
+	if err := h.b.NetworkLockInit(req.Keys, req.DisablementValues); err != nil {
 		http.Error(w, "initialization failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

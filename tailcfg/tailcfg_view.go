@@ -171,6 +171,7 @@ func (v NodeView) Online() *bool {
 func (v NodeView) KeepAlive() bool                   { return v.ж.KeepAlive }
 func (v NodeView) MachineAuthorized() bool           { return v.ж.MachineAuthorized }
 func (v NodeView) Capabilities() views.Slice[string] { return views.SliceOf(v.ж.Capabilities) }
+func (v NodeView) UnsignedPeerAPIOnly() bool         { return v.ж.UnsignedPeerAPIOnly }
 func (v NodeView) ComputedName() string              { return v.ж.ComputedName }
 func (v NodeView) ComputedNameWithHost() string      { return v.ж.ComputedNameWithHost }
 func (v NodeView) DataPlaneAuditLogID() string       { return v.ж.DataPlaneAuditLogID }
@@ -201,6 +202,7 @@ var _NodeViewNeedsRegeneration = Node(struct {
 	KeepAlive               bool
 	MachineAuthorized       bool
 	Capabilities            []string
+	UnsignedPeerAPIOnly     bool
 	ComputedName            string
 	computedHostIfDifferent string
 	ComputedNameWithHost    string
@@ -515,7 +517,6 @@ func (v DNSConfigView) FallbackResolvers() views.SliceView[*dnstype.Resolver, dn
 func (v DNSConfigView) Domains() views.Slice[string]         { return views.SliceOf(v.ж.Domains) }
 func (v DNSConfigView) Proxied() bool                        { return v.ж.Proxied }
 func (v DNSConfigView) Nameservers() views.Slice[netip.Addr] { return views.SliceOf(v.ж.Nameservers) }
-func (v DNSConfigView) PerDomain() bool                      { return v.ж.PerDomain }
 func (v DNSConfigView) CertDomains() views.Slice[string]     { return views.SliceOf(v.ж.CertDomains) }
 func (v DNSConfigView) ExtraRecords() views.Slice[DNSRecord] { return views.SliceOf(v.ж.ExtraRecords) }
 func (v DNSConfigView) ExitNodeFilteredSet() views.Slice[string] {
@@ -530,7 +531,6 @@ var _DNSConfigViewNeedsRegeneration = DNSConfig(struct {
 	Domains             []string
 	Proxied             bool
 	Nameservers         []netip.Addr
-	PerDomain           bool
 	CertDomains         []string
 	ExtraRecords        []DNSRecord
 	ExitNodeFilteredSet []string

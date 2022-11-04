@@ -20,10 +20,10 @@ import (
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
-	"tailscale.com/net/flowtrack"
 	"tailscale.com/net/tsaddr"
-	"tailscale.com/net/tunstats"
 	"tailscale.com/smallzstd"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/netlogtype"
 	"tailscale.com/wgengine/router"
 )
 
@@ -32,33 +32,16 @@ const pollPeriod = 5 * time.Second
 
 // Device is an abstraction over a tunnel device or a magic socket.
 // *tstun.Wrapper implements this interface.
-//
-// TODO(joetsai): Make *magicsock.Conn implement this interface.
+// *magicsock.Conn implements this interface.
 type Device interface {
 	SetStatisticsEnabled(bool)
-	ExtractStatistics() map[flowtrack.Tuple]tunstats.Counts
+	ExtractStatistics() map[netlogtype.Connection]netlogtype.Counts
 }
 
 type noopDevice struct{}
 
-func (noopDevice) SetStatisticsEnabled(bool)                              {}
-func (noopDevice) ExtractStatistics() map[flowtrack.Tuple]tunstats.Counts { return nil }
-
-// Message is the log message that captures network traffic.
-type Message struct {
-	Start           time.Time     `json:"start"` // inclusive
-	End             time.Time     `json:"end"`   // inclusive
-	VirtualTraffic  []TupleCounts `json:"virtualTraffic,omitempty"`
-	SubnetTraffic   []TupleCounts `json:"subnetTraffic,omitempty"`
-	ExitTraffic     []TupleCounts `json:"exitTraffic,omitempty"`
-	PhysicalTraffic []TupleCounts `json:"physicalTraffic,omitempty"`
-}
-
-// TupleCounts is a flattened struct of both a connection and counts.
-type TupleCounts struct {
-	flowtrack.Tuple
-	tunstats.Counts
-}
+func (noopDevice) SetStatisticsEnabled(bool)                                      {}
+func (noopDevice) ExtractStatistics() map[netlogtype.Connection]netlogtype.Counts { return nil }
 
 // Logger logs statistics about every connection.
 // At present, it only logs connections within a tailscale network.
@@ -109,7 +92,7 @@ var testClient *http.Client
 // is a non-tailscale IP address to contact for that particular tailscale node.
 // The IP protocol and source port are always zero.
 // The sock is used to populated the PhysicalTraffic field in Message.
-func (nl *Logger) Startup(nodeID, domainID logtail.PrivateID, tun, sock Device) error {
+func (nl *Logger) Startup(nodeID tailcfg.StableNodeID, nodeLogID, domainLogID logtail.PrivateID, tun, sock Device) error {
 	nl.mu.Lock()
 	defer nl.mu.Unlock()
 	if nl.logger != nil {
@@ -128,8 +111,8 @@ func (nl *Logger) Startup(nodeID, domainID logtail.PrivateID, tun, sock Device) 
 	}
 	logger := logtail.NewLogger(logtail.Config{
 		Collection:    "tailtraffic.log.tailscale.io",
-		PrivateID:     nodeID,
-		CopyPrivateID: domainID,
+		PrivateID:     nodeLogID,
+		CopyPrivateID: domainLogID,
 		Stderr:        io.Discard,
 		// TODO(joetsai): Set Buffer? Use an in-memory buffer for now.
 		NewZstdEncoder: func() logtail.Encoder {
@@ -179,7 +162,7 @@ func (nl *Logger) Startup(nodeID, domainID logtail.PrivateID, tun, sock Device) 
 				addrs := nl.addrs
 				prefixes := nl.prefixes
 				nl.mu.Unlock()
-				recordStatistics(logger, start, end, tunStats, sockStats, addrs, prefixes)
+				recordStatistics(logger, nodeID, start, end, tunStats, sockStats, addrs, prefixes)
 			}
 
 			if ctx.Err() != nil {
@@ -192,8 +175,8 @@ func (nl *Logger) Startup(nodeID, domainID logtail.PrivateID, tun, sock Device) 
 	return nil
 }
 
-func recordStatistics(logger *logtail.Logger, start, end time.Time, tunStats, sockStats map[flowtrack.Tuple]tunstats.Counts, addrs map[netip.Addr]bool, prefixes map[netip.Prefix]bool) {
-	m := Message{Start: start.UTC(), End: end.UTC()}
+func recordStatistics(logger *logtail.Logger, nodeID tailcfg.StableNodeID, start, end time.Time, tunStats, sockStats map[netlogtype.Connection]netlogtype.Counts, addrs map[netip.Addr]bool, prefixes map[netip.Prefix]bool) {
+	m := netlogtype.Message{NodeID: nodeID, Start: start.UTC(), End: end.UTC()}
 
 	classifyAddr := func(a netip.Addr) (isTailscale, withinRoute bool) {
 		// NOTE: There could be mis-classifications where an address is treated
@@ -204,38 +187,60 @@ func recordStatistics(logger *logtail.Logger, start, end time.Time, tunStats, so
 		for p := range prefixes {
 			if p.Contains(a) && p.Bits() > 0 {
 				withinRoute = true
+				break
 			}
 		}
 		return withinRoute && tsaddr.IsTailscaleIP(a), withinRoute && !tsaddr.IsTailscaleIP(a)
 	}
 
+	exitTraffic := make(map[netlogtype.Connection]netlogtype.Counts)
 	for conn, cnts := range tunStats {
 		srcIsTailscaleIP, srcWithinSubnet := classifyAddr(conn.Src.Addr())
 		dstIsTailscaleIP, dstWithinSubnet := classifyAddr(conn.Dst.Addr())
 		switch {
 		case srcIsTailscaleIP && dstIsTailscaleIP:
-			m.VirtualTraffic = append(m.VirtualTraffic, TupleCounts{conn, cnts})
+			m.VirtualTraffic = append(m.VirtualTraffic, netlogtype.ConnectionCounts{Connection: conn, Counts: cnts})
 		case srcWithinSubnet || dstWithinSubnet:
-			m.SubnetTraffic = append(m.SubnetTraffic, TupleCounts{conn, cnts})
+			m.SubnetTraffic = append(m.SubnetTraffic, netlogtype.ConnectionCounts{Connection: conn, Counts: cnts})
 		default:
 			const anonymize = true
 			if anonymize {
-				if len(m.ExitTraffic) == 0 {
-					m.ExitTraffic = []TupleCounts{{}}
+				// Only preserve the address if it is a Tailscale IP address.
+				srcOrig, dstOrig := conn.Src, conn.Dst
+				conn = netlogtype.Connection{} // scrub everything by default
+				if srcIsTailscaleIP {
+					conn.Src = netip.AddrPortFrom(srcOrig.Addr(), 0)
 				}
-				m.ExitTraffic[0].Counts = m.ExitTraffic[0].Counts.Add(cnts)
-			} else {
-				m.ExitTraffic = append(m.ExitTraffic, TupleCounts{conn, cnts})
+				if dstIsTailscaleIP {
+					conn.Dst = netip.AddrPortFrom(dstOrig.Addr(), 0)
+				}
 			}
+			exitTraffic[conn] = exitTraffic[conn].Add(cnts)
 		}
 	}
+	for conn, cnts := range exitTraffic {
+		m.ExitTraffic = append(m.ExitTraffic, netlogtype.ConnectionCounts{Connection: conn, Counts: cnts})
+	}
 	for conn, cnts := range sockStats {
-		m.PhysicalTraffic = append(m.PhysicalTraffic, TupleCounts{conn, cnts})
+		m.PhysicalTraffic = append(m.PhysicalTraffic, netlogtype.ConnectionCounts{Connection: conn, Counts: cnts})
 	}
 
 	if len(m.VirtualTraffic)+len(m.SubnetTraffic)+len(m.ExitTraffic)+len(m.PhysicalTraffic) > 0 {
+		// TODO(joetsai): Place a hard limit on the size of a network log message.
+		// The log server rejects any payloads above a certain size, so logging
+		// a message that large would cause logtail to be stuck forever trying
+		// and failing to upload the same excessively large payload.
+		//
+		// We should figure out the behavior for handling this. We could split
+		// the message apart so that there are multiple chunks with the same window,
+		// We could also consider reducing the granularity of the data
+		// by dropping port numbers.
+		const maxSize = 256 << 10
 		if b, err := json.Marshal(m); err != nil {
 			logger.Logf("json.Marshal error: %v", err)
+		} else if len(b) > maxSize {
+			logger.Logf("JSON body too large: %dB (virtual:%d subnet:%d exit:%d physical:%d)",
+				len(b), len(m.VirtualTraffic), len(m.SubnetTraffic), len(m.ExitTraffic), len(m.PhysicalTraffic))
 		} else {
 			logger.Logf("%s", b)
 		}

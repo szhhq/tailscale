@@ -92,6 +92,7 @@ var _NodeCloneNeedsRegeneration = Node(struct {
 	KeepAlive               bool
 	MachineAuthorized       bool
 	Capabilities            []string
+	UnsignedPeerAPIOnly     bool
 	ComputedName            string
 	computedHostIfDifferent string
 	ComputedNameWithHost    string
@@ -239,7 +240,6 @@ var _DNSConfigCloneNeedsRegeneration = DNSConfig(struct {
 	Domains             []string
 	Proxied             bool
 	Nameservers         []netip.Addr
-	PerDomain           bool
 	CertDomains         []string
 	ExtraRecords        []DNSRecord
 	ExitNodeFilteredSet []string

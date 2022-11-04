@@ -22,7 +22,6 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"tailscale.com/disco"
-	"tailscale.com/net/flowtrack"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tunstats"
@@ -31,6 +30,7 @@ import (
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/netlogtype"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/wgengine/filter"
 )
@@ -82,7 +82,7 @@ type Wrapper struct {
 
 	// lastActivityAtomic is read/written atomically.
 	// On 32 bit systems, if the fields above change,
-	// you might need to add a pad32.Four field here.
+	// you might need to add an align64 field here.
 	lastActivityAtomic mono.Time // time of last send or receive
 
 	destIPActivity syncs.AtomicValue[map[netip.Addr]func()]
@@ -853,7 +853,7 @@ func (t *Wrapper) SetStatisticsEnabled(enable bool) {
 
 // ExtractStatistics extracts and resets the counters for all active connections.
 // It must be called periodically otherwise the memory used is unbounded.
-func (t *Wrapper) ExtractStatistics() map[flowtrack.Tuple]tunstats.Counts {
+func (t *Wrapper) ExtractStatistics() map[netlogtype.Connection]netlogtype.Counts {
 	return t.stats.Extract()
 }
 

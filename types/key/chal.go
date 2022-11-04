@@ -7,6 +7,7 @@ package key
 import (
 	"errors"
 
+	"go4.org/mem"
 	"tailscale.com/types/structs"
 )
 
@@ -76,3 +77,11 @@ func (k ChallengePublic) String() string {
 func (k ChallengePublic) MarshalText() ([]byte, error) {
 	return toHex(k.k[:], chalPublicHexPrefix), nil
 }
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (k *ChallengePublic) UnmarshalText(b []byte) error {
+	return parseHex(k.k[:], mem.B(b), mem.S(chalPublicHexPrefix))
+}
+
+// IsZero reports whether k is the zero value.
+func (k ChallengePublic) IsZero() bool { return k == ChallengePublic{} }

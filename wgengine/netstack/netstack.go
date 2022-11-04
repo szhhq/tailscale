@@ -127,10 +127,6 @@ type Impl struct {
 	connsOpenBySubnetIP map[netip.Addr]int
 }
 
-// handleSSH is initialized in ssh.go (on Linux only) to register an SSH server
-// handler. See https://github.com/tailscale/tailscale/issues/3802.
-var handleSSH func(logger.Logf, *ipnlocal.LocalBackend, net.Conn) error
-
 const nicID = 1
 const mtu = tstun.DefaultMTU
 
@@ -160,6 +156,11 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 	})
+	sackEnabledOpt := tcpip.TCPSACKEnabled(true) // TCP SACK is disabled by default
+	tcpipErr := ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
+	if tcpipErr != nil {
+		return nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
+	}
 	linkEP := channel.New(512, mtu, "")
 	if tcpipProblem := ipstack.CreateNIC(nicID, linkEP); tcpipProblem != nil {
 		return nil, fmt.Errorf("could not create netstack NIC: %v", tcpipProblem)
@@ -807,7 +808,7 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	// request until we're sure that the connection can be handled by this
 	// endpoint. This function sets up the TCP connection and should be
 	// called immediately before a connection is handled.
-	createConn := func() *gonet.TCPConn {
+	createConn := func(opts ...tcpip.SettableSocketOption) *gonet.TCPConn {
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
 			ns.logf("CreateEndpoint error for %s: %v", stringifyTEI(reqDetails), err)
@@ -815,7 +816,9 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 			return nil
 		}
 		r.Complete(false)
-
+		for _, opt := range opts {
+			ep.SetSockOpt(opt)
+		}
 		// SetKeepAlive so that idle connections to peers that have forgotten about
 		// the connection or gone completely offline eventually time out.
 		// Applications might be setting this on a forwarded connection, but from
@@ -854,7 +857,14 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 
 	if ns.lb != nil {
 		if reqDetails.LocalPort == 22 && ns.processSSH() && ns.isLocalIP(dialIP) {
-			c := createConn()
+			// Use a higher keepalive idle time for SSH connections, as they are
+			// typically long lived and idle connections are more likely to be
+			// intentional. Ideally we would turn this off entirely, but we can't
+			// tell the difference between a long lived connection that is idle
+			// vs a connection that is dead because the peer has gone away.
+			// We pick 72h as that is typically sufficient for a long weekend.
+			idle := tcpip.KeepaliveIdleOption(72 * time.Hour)
+			c := createConn(&idle)
 			if c == nil {
 				return
 			}
@@ -904,7 +914,7 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	}
 }
 
-func (ns *Impl) forwardTCP(getClient func() *gonet.TCPConn, clientRemoteIP netip.Addr, wq *waiter.Queue, dialAddr netip.AddrPort) (handled bool) {
+func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.TCPConn, clientRemoteIP netip.Addr, wq *waiter.Queue, dialAddr netip.AddrPort) (handled bool) {
 	dialAddrStr := dialAddr.String()
 	if debugNetstack() {
 		ns.logf("[v2] netstack: forwarding incoming connection to %s", dialAddrStr)

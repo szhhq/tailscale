@@ -11,9 +11,8 @@ import (
 
 	qt "github.com/frankban/quicktest"
 	"tailscale.com/logtail"
-	"tailscale.com/net/flowtrack"
-	"tailscale.com/net/tunstats"
 	"tailscale.com/tstest"
+	"tailscale.com/types/netlogtype"
 	"tailscale.com/util/must"
 	"tailscale.com/wgengine/router"
 )
@@ -42,7 +41,7 @@ func (d *fakeDevice) SetStatisticsEnabled(enable bool) {
 	}
 
 }
-func (fakeDevice) ExtractStatistics() map[flowtrack.Tuple]tunstats.Counts {
+func (fakeDevice) ExtractStatistics() map[netlogtype.Connection]netlogtype.Counts {
 	// TODO(dsnet): Add a test that verifies that statistics are correctly
 	// extracted from the device and uploaded. Unfortunately,
 	// we can't reliably run this test until we fix http://go/oss/5856.
@@ -59,7 +58,7 @@ func TestResourceCheck(t *testing.T) {
 	var l Logger
 	var d fakeDevice
 	for i := 0; i < 10; i++ {
-		must.Do(l.Startup(logtail.PrivateID{}, logtail.PrivateID{}, &d, nil))
+		must.Do(l.Startup("", logtail.PrivateID{}, logtail.PrivateID{}, &d, nil))
 		l.ReconfigRoutes(&router.Config{})
 		must.Do(l.Shutdown(context.Background()))
 		c.Assert(d.toggled, qt.Equals, 2*(i+1))
