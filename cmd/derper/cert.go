@@ -96,10 +96,10 @@ func (m *manualCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certif
 
 	// Return a shallow copy of the cert so the caller can append to its
 	// Certificate field.
-	// certCopy := new(tls.Certificate)
-	// *certCopy = *m.cert
-	// certCopy.Certificate = certCopy.Certificate[:len(certCopy.Certificate):len(certCopy.Certificate)]
-	// return certCopy, nil
+	certCopy := new(tls.Certificate)
+	*certCopy = *m.cert
+	certCopy.Certificate = certCopy.Certificate[:len(certCopy.Certificate):len(certCopy.Certificate)]
+	return certCopy, nil
 }
 
 func (m *manualCertManager) HTTPHandler(fallback http.Handler) http.Handler {
