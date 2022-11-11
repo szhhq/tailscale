@@ -144,6 +144,16 @@ var debugCmd = &ffcli.Command{
 				return fs
 			})(),
 		},
+		{
+			Name:      "dev-store-set",
+			Exec:      runDevStoreSet,
+			ShortHelp: "set a key/value pair during development",
+			FlagSet: (func() *flag.FlagSet {
+				fs := newFlagSet("store-set")
+				fs.BoolVar(&devStoreSetArgs.danger, "danger", false, "accept danger")
+				return fs
+			})(),
+		},
 	},
 }
 
@@ -178,9 +188,9 @@ func runDebug(ctx context.Context, args []string) error {
 	}
 	var usedFlag bool
 	if out := debugArgs.cpuFile; out != "" {
-		usedFlag = true // TODO(bradfitz): add "profile" subcommand
+		usedFlag = true // TODO(bradfitz): add "pprof" subcommand
 		log.Printf("Capturing CPU profile for %v seconds ...", debugArgs.cpuSec)
-		if v, err := localClient.Profile(ctx, "profile", debugArgs.cpuSec); err != nil {
+		if v, err := localClient.Pprof(ctx, "profile", debugArgs.cpuSec); err != nil {
 			return err
 		} else {
 			if err := writeProfile(out, v); err != nil {
@@ -190,9 +200,9 @@ func runDebug(ctx context.Context, args []string) error {
 		}
 	}
 	if out := debugArgs.memFile; out != "" {
-		usedFlag = true // TODO(bradfitz): add "profile" subcommand
+		usedFlag = true // TODO(bradfitz): add "pprof" subcommand
 		log.Printf("Capturing memory profile ...")
-		if v, err := localClient.Profile(ctx, "heap", 0); err != nil {
+		if v, err := localClient.Pprof(ctx, "heap", 0); err != nil {
 			return err
 		} else {
 			if err := writeProfile(out, v); err != nil {
@@ -545,4 +555,42 @@ func runDebugComponentLogs(ctx context.Context, args []string) error {
 		fmt.Printf("Enabled debug logs for component %q for %v\n", component, dur)
 	}
 	return nil
+}
+
+var devStoreSetArgs struct {
+	danger bool
+}
+
+func runDevStoreSet(ctx context.Context, args []string) error {
+	// TODO(bradfitz): remove this temporary (2022-11-09) hack once
+	// profile stuff and serving CLI commands are more fleshed out.
+	isServe := len(args) >= 1 && strings.HasPrefix(args[0], "_serve/")
+	if isServe {
+		st, err := localClient.StatusWithoutPeers(ctx)
+		if err != nil {
+			return err
+		}
+		args[0] = "_serve/node-" + string(st.Self.ID)
+		log.Printf("Using key %q instead.", args[0])
+	}
+	if len(args) != 2 {
+		return errors.New("usage: dev-store-set --danger <key> <value>")
+	}
+	if !devStoreSetArgs.danger {
+		return errors.New("this command is dangerous; use --danger to proceed")
+	}
+	key, val := args[0], args[1]
+	if val == "-" {
+		valb, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		if isServe {
+			if err := json.Unmarshal(valb, new(ipn.ServeConfig)); err != nil {
+				return fmt.Errorf("invalid JSON: %w", err)
+			}
+		}
+		val = string(valb)
+	}
+	return localClient.SetDevStoreKeyValue(ctx, key, val)
 }

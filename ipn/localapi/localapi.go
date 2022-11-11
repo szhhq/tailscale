@@ -61,6 +61,7 @@ var handler = map[string]localAPIHandler{
 	"component-debug-logging": (*Handler).serveComponentDebugLogging,
 	"debug":                   (*Handler).serveDebug,
 	"derpmap":                 (*Handler).serveDERPMap,
+	"dev-set-state-store":     (*Handler).serveDevSetStateStore,
 	"dial":                    (*Handler).serveDial,
 	"file-targets":            (*Handler).serveFileTargets,
 	"goroutines":              (*Handler).serveGoroutines,
@@ -70,7 +71,8 @@ var handler = map[string]localAPIHandler{
 	"metrics":                 (*Handler).serveMetrics,
 	"ping":                    (*Handler).servePing,
 	"prefs":                   (*Handler).servePrefs,
-	"profile":                 (*Handler).serveProfile,
+	"pprof":                   (*Handler).servePprof,
+	"serve-config":            (*Handler).serveServeConfig,
 	"set-dns":                 (*Handler).serveSetDNS,
 	"set-expiry-sooner":       (*Handler).serveSetExpirySooner,
 	"status":                  (*Handler).serveStatus,
@@ -401,6 +403,23 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "done\n")
 }
 
+func (h *Handler) serveDevSetStateStore(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "debug access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.b.SetDevStateStore(r.FormValue("key"), r.FormValue("value")); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	io.WriteString(w, "done\n")
+}
+
 func (h *Handler) serveComponentDebugLogging(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
 		http.Error(w, "debug access denied", http.StatusForbidden)
@@ -419,22 +438,57 @@ func (h *Handler) serveComponentDebugLogging(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(res)
 }
 
-// serveProfileFunc is the implementation of Handler.serveProfile, after auth,
+// servePprofFunc is the implementation of Handler.servePprof, after auth,
 // for platforms where we want to link it in.
-var serveProfileFunc func(http.ResponseWriter, *http.Request)
+var servePprofFunc func(http.ResponseWriter, *http.Request)
 
-func (h *Handler) serveProfile(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) servePprof(w http.ResponseWriter, r *http.Request) {
 	// Require write access out of paranoia that the profile dump
 	// might contain something sensitive.
 	if !h.PermitWrite {
 		http.Error(w, "profile access denied", http.StatusForbidden)
 		return
 	}
-	if serveProfileFunc == nil {
+	if servePprofFunc == nil {
 		http.Error(w, "not implemented on this platform", http.StatusServiceUnavailable)
 		return
 	}
-	serveProfileFunc(w, r)
+	servePprofFunc(w, r)
+}
+
+func (h *Handler) serveServeConfig(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "serve config denied", http.StatusForbidden)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case "GET":
+		config := h.b.ServeConfig()
+		json.NewEncoder(w).Encode(config)
+	case "POST":
+		configIn := new(ipn.ServeConfig)
+		if err := json.NewDecoder(r.Body).Decode(configIn); err != nil {
+			json.NewEncoder(w).Encode(struct {
+				Error error
+			}{
+				Error: fmt.Errorf("decoding config: %w", err),
+			})
+			return
+		}
+		err := h.b.SetServeConfig(configIn)
+		if err != nil {
+			json.NewEncoder(w).Encode(struct {
+				Error error
+			}{
+				Error: fmt.Errorf("updating config: %w", err),
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
 }
 
 func (h *Handler) serveCheckIPForwarding(w http.ResponseWriter, r *http.Request) {

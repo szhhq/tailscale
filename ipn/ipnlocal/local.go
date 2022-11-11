@@ -7,6 +7,7 @@ package ipnlocal
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go4.org/mem"
 	"go4.org/netipx"
 	"golang.org/x/exp/slices"
 	"tailscale.com/client/tailscale/apitype"
@@ -62,6 +64,7 @@ import (
 	"tailscale.com/util/multierr"
 	"tailscale.com/util/osshare"
 	"tailscale.com/util/systemd"
+	"tailscale.com/util/uniq"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
@@ -135,8 +138,9 @@ type LocalBackend struct {
 	sshAtomicBool         atomic.Bool
 	shutdownCalled        bool // if Shutdown has been called
 
-	filterAtomic            atomic.Pointer[filter.Filter]
-	containsViaIPFuncAtomic syncs.AtomicValue[func(netip.Addr) bool]
+	filterAtomic                 atomic.Pointer[filter.Filter]
+	containsViaIPFuncAtomic      syncs.AtomicValue[func(netip.Addr) bool]
+	shouldInterceptTCPPortAtomic syncs.AtomicValue[func(uint16) bool]
 
 	// The mutex protects the following elements.
 	mu             sync.Mutex
@@ -191,6 +195,10 @@ type LocalBackend struct {
 	directFileRoot          string
 	directFileDoFinalRename bool // false on macOS, true on several NAS platforms
 	componentLogUntil       map[string]componentLogState
+
+	// ServeConfig fields. (also guarded by mu)
+	lastServeConfJSON mem.RO              // last JSON that was parsed into serveConfig
+	serveConfig       ipn.ServeConfigView // or !Valid if none
 
 	// statusLock must be held before calling statusChanged.Wait() or
 	// statusChanged.Broadcast().
@@ -256,6 +264,8 @@ func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, diale
 
 	// Default filter blocks everything and logs nothing, until Start() is called.
 	b.setFilter(filter.NewAllowNone(logf, &netipx.IPSet{}))
+
+	b.setTCPPortsIntercepted(nil)
 
 	b.statusChanged = sync.NewCond(&b.statusLock)
 	b.e.SetStatusCallback(b.setWgengineStatus)
@@ -850,6 +860,7 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 		b.setNetMapLocked(st.NetMap)
 		b.updateFilterLocked(st.NetMap, b.prefs)
 	}
+	userID := b.userID
 	b.mu.Unlock()
 
 	// Now complete the lock-free parts of what we started while locked.
@@ -859,6 +870,8 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 				b.logf("Failed to save new controlclient state: %v", err)
 			}
 		}
+		b.writeServerModeStartState(userID, prefs.View())
+
 		p := prefs.View()
 		b.send(ipn.Notify{Prefs: &p})
 	}
@@ -1142,6 +1155,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 			}
 		}
 		b.setAtomicValuesFromPrefs(b.prefs)
+		b.setTCPPortsInterceptedFromNetmapAndPrefsLocked()
 	}
 
 	wantRunning := b.prefs.WantRunning()
@@ -1906,6 +1920,7 @@ func (b *LocalBackend) loadStateLocked(key ipn.StateKey, prefs *ipn.Prefs) (err 
 		// value instead of making up a new one.
 		b.logf("using frontend prefs: %s", prefs.Pretty())
 		b.prefs = prefs.Clone().View()
+		b.setTCPPortsInterceptedFromNetmapAndPrefsLocked()
 		b.writeServerModeStartState(b.userID, b.prefs)
 		return nil
 	}
@@ -1926,6 +1941,7 @@ func (b *LocalBackend) loadStateLocked(key ipn.StateKey, prefs *ipn.Prefs) (err 
 		prefs.WantRunning = false
 		b.logf("using backend prefs; created empty state for %q: %s", key, prefs.Pretty())
 		b.prefs = prefs.View()
+		b.setTCPPortsInterceptedFromNetmapAndPrefsLocked()
 		return nil
 	case err != nil:
 		return fmt.Errorf("backend prefs: store.ReadState(%q): %v", key, err)
@@ -1952,8 +1968,46 @@ func (b *LocalBackend) loadStateLocked(key ipn.StateKey, prefs *ipn.Prefs) (err 
 	b.prefs = prefs.View()
 
 	b.setAtomicValuesFromPrefs(b.prefs)
+	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked()
 
 	return nil
+}
+
+// setTCPPortsIntercepted populates b.shouldInterceptTCPPortAtomic with an
+// efficient func for ShouldInterceptTCPPort to use, which is called on every
+// incoming packet.
+func (b *LocalBackend) setTCPPortsIntercepted(ports []uint16) {
+	slices.Sort(ports)
+	uniq.ModifySlice(&ports)
+	var f func(uint16) bool
+	switch len(ports) {
+	case 0:
+		f = func(uint16) bool { return false }
+	case 1:
+		f = func(p uint16) bool { return ports[0] == p }
+	case 2:
+		f = func(p uint16) bool { return ports[0] == p || ports[1] == p }
+	case 3:
+		f = func(p uint16) bool { return ports[0] == p || ports[1] == p || ports[2] == p }
+	default:
+		if len(ports) > 16 {
+			m := map[uint16]bool{}
+			for _, p := range ports {
+				m[p] = true
+			}
+			f = func(p uint16) bool { return m[p] }
+		} else {
+			f = func(p uint16) bool {
+				for _, x := range ports {
+					if p == x {
+						return true
+					}
+				}
+				return false
+			}
+		}
+	}
+	b.shouldInterceptTCPPortAtomic.Store(f)
 }
 
 // setAtomicValuesFromPrefs populates sshAtomicBool and containsViaIPFuncAtomic
@@ -1963,6 +2017,7 @@ func (b *LocalBackend) setAtomicValuesFromPrefs(p ipn.PrefsView) {
 
 	if !p.Valid() {
 		b.containsViaIPFuncAtomic.Store(tsaddr.NewContainsIPFunc(nil))
+		b.setTCPPortsIntercepted(nil)
 	} else {
 		b.containsViaIPFuncAtomic.Store(tsaddr.NewContainsIPFunc(p.AdvertiseRoutes().Filter(tsaddr.IsViaPrefix)))
 	}
@@ -2171,6 +2226,7 @@ func (b *LocalBackend) checkSSHPrefsLocked(p *ipn.Prefs) error {
 		if !envknob.UseWIPCode() {
 			return errors.New("The Tailscale SSH server is disabled on macOS tailscaled by default. To try, set env TAILSCALE_USE_WIP_CODE=1")
 		}
+	case "freebsd":
 	default:
 		return errors.New("The Tailscale SSH server is not supported on " + runtime.GOOS)
 	}
@@ -2283,8 +2339,8 @@ func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) ipn
 	// anyway. No-op if no exit node resolution is needed.
 	findExitNodeIDLocked(newp, netMap)
 	b.prefs = newp.View()
-
 	b.setAtomicValuesFromPrefs(b.prefs)
+	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked()
 	b.inServerMode = b.prefs.ForceDaemon()
 	// We do this to avoid holding the lock while doing everything else.
 
@@ -3281,6 +3337,7 @@ func (b *LocalBackend) ResetForClientDisconnect() {
 	b.authURLSticky = ""
 	b.activeLogin = ""
 	b.setAtomicValuesFromPrefs(b.prefs)
+	b.setTCPPortsIntercepted(nil)
 }
 
 func (b *LocalBackend) ShouldRunSSH() bool { return b.sshAtomicBool.Load() && envknob.CanSSHD() }
@@ -3402,6 +3459,7 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	}
 	b.capFileSharing = fs
 
+	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked()
 	if nm == nil {
 		b.nodeByAddr = nil
 		return
@@ -3434,6 +3492,86 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 			delete(b.nodeByAddr, k)
 		}
 	}
+}
+
+// setTCPPortsInterceptedFromNetmapAndPrefsLocked calls setTCPPortsIntercepted with
+// the ports that tailscaled should handle as a function of b.netMap and b.prefs.
+//
+// b.mu must be held.
+func (b *LocalBackend) setTCPPortsInterceptedFromNetmapAndPrefsLocked() {
+	handlePorts := make([]uint16, 0, 4)
+
+	prefs := b.prefs
+	if prefs.Valid() && prefs.RunSSH() && envknob.CanSSHD() {
+		handlePorts = append(handlePorts, 22)
+	}
+
+	nm := b.netMap
+	if nm != nil && nm.SelfNode != nil {
+		profileID := fmt.Sprintf("node-%s", nm.SelfNode.StableID) // TODO(maisem,bradfitz): something else?
+		confKey := ipn.ServeConfigKey(profileID)
+		if confj, err := b.store.ReadState(confKey); err == nil {
+			if !b.lastServeConfJSON.Equal(mem.B(confj)) {
+				b.lastServeConfJSON = mem.B(confj)
+				var conf ipn.ServeConfig
+				if err := json.Unmarshal(confj, &conf); err != nil {
+					b.logf("invalid ServeConfig %q in StateStore: %v", confKey, err)
+					b.serveConfig = ipn.ServeConfigView{}
+				} else {
+					b.serveConfig = conf.View()
+				}
+			}
+			if b.serveConfig.Valid() {
+				b.serveConfig.TCP().Range(func(port uint16, _ ipn.TCPPortHandlerView) bool {
+					if port > 0 {
+						handlePorts = append(handlePorts, uint16(port))
+					}
+					return true
+				})
+			}
+		}
+	}
+	b.setTCPPortsIntercepted(handlePorts)
+}
+
+// SetServeConfig establishes or replaces the current serve config.
+func (b *LocalBackend) SetServeConfig(config *ipn.ServeConfig) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	nm := b.netMap
+	if nm == nil {
+		return errors.New("netMap is nil")
+	}
+	if nm.SelfNode == nil {
+		return errors.New("netMap SelfNode is nil")
+	}
+	profileID := fmt.Sprintf("node-%s", nm.SelfNode.StableID) // TODO(maisem,bradfitz): something else?
+	confKey := ipn.ServeConfigKey(profileID)
+
+	var bs []byte
+	if config != nil {
+		j, err := json.Marshal(config)
+		if err != nil {
+			return fmt.Errorf("encoding serve config: %w", err)
+		}
+		bs = j
+	}
+	if err := b.store.WriteState(confKey, bs); err != nil {
+		return fmt.Errorf("writing ServeConfig to StateStore: %w", err)
+	}
+
+	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked()
+
+	return nil
+}
+
+// ServeConfig provides a view of the current serve mappings.
+// If serving is not configured, the returned view is not Valid.
+func (b *LocalBackend) ServeConfig() ipn.ServeConfigView {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.serveConfig
 }
 
 // operatorUserName returns the current pref's OperatorUser's name, or the
@@ -3965,4 +4103,32 @@ func (b *LocalBackend) Doctor(ctx context.Context, logf logger.Logf) {
 	}))
 
 	doctor.RunChecks(ctx, logf, checks...)
+}
+
+// SetDevStateStore updates the LocalBackend's state storage to the provided values.
+//
+// It's meant only for development.
+func (b *LocalBackend) SetDevStateStore(key, value string) error {
+	if b.store == nil {
+		return errors.New("no state store")
+	}
+	err := b.store.WriteState(ipn.StateKey(key), []byte(value))
+	b.logf("SetDevStateStore(%q, %q) = %v", key, value, err)
+
+	if err != nil {
+		return err
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked()
+
+	return nil
+}
+
+// ShouldInterceptTCPPort reports whether the given TCP port number to a
+// Tailscale IP (not a subnet router, service IP, etc) should be intercepted by
+// Tailscaled and handled in-process.
+func (b *LocalBackend) ShouldInterceptTCPPort(port uint16) bool {
+	return b.shouldInterceptTCPPortAtomic.Load()(port)
 }
